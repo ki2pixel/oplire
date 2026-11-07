@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use oplire_reset::{AppConfig, ProxyPool};
+use oplire_reset::{write_restricted_file, AppConfig, ProxyPool};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -93,7 +93,7 @@ enum Commands {
     },
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand)]
 enum ProxiesAction {
     /// List all configured proxies and highlight the active one
     List {},
@@ -109,9 +109,21 @@ enum ProxiesAction {
     /// Fetch static ISP proxies from Proxiware API
     Fetch {
         /// Proxiware API key (or set via PROXIWARE_API_KEY environment variable)
-        #[arg(long, env = "PROXIWARE_API_KEY")]
+        #[arg(long, env = "PROXIWARE_API_KEY", hide_env_values = true)]
         api_key: String,
     },
+}
+
+impl std::fmt::Debug for ProxiesAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::List {} => f.write_str("List"),
+            Self::Test {} => f.write_str("Test"),
+            Self::Next {} => f.write_str("Next"),
+            Self::Import { file } => f.debug_struct("Import").field("file", file).finish(),
+            Self::Fetch { .. } => f.write_str("Fetch { api_key: \"***REDACTED***\" }"),
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -138,30 +150,7 @@ enum ConfigAction {
 }
 
 fn config_path() -> PathBuf {
-    let mut path = dirs_config_dir().unwrap_or_else(|| PathBuf::from("."));
-    path.push("oplire");
-    path.push("config.json");
-    path
-}
-
-fn dirs_config_dir() -> Option<PathBuf> {
-    if cfg!(target_os = "macos") {
-        if let Ok(home) = std::env::var("HOME") {
-            let mut p = PathBuf::from(home);
-            p.push("Library");
-            p.push("Application Support");
-            return Some(p);
-        }
-    }
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(xdg));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let mut p = PathBuf::from(home);
-        p.push(".config");
-        return Some(p);
-    }
-    None
+    ProxyPool::config_dir().join("config.json")
 }
 
 fn load_config() -> AppConfig {
@@ -178,12 +167,8 @@ fn load_config() -> AppConfig {
 
 fn save_config(config: &AppConfig) -> Result<(), String> {
     let path = config_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
     let content = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
-    fs::write(&path, content).map_err(|e| e.to_string())?;
-    Ok(())
+    write_restricted_file(&path, &content).map_err(|e| e.to_string())
 }
 
 fn check_opencode_installed() -> bool {
@@ -191,13 +176,23 @@ fn check_opencode_installed() -> bool {
         || Command::new("opencode").arg("--help").output().is_ok()
 }
 
-fn check_opencode_running(base_url: &str) -> bool {
+async fn check_opencode_running(base_url: &str) -> bool {
     let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
-    reqwest::blocking::Client::new()
-        .get(&url)
+    let client = match reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(std::time::Duration::from_secs(3))
         .timeout(std::time::Duration::from_secs(3))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+
+    client
+        .get(&url)
         .send()
-        .map(|r| r.status().is_success())
+        .await
+        .map(|response| response.status().is_success())
         .unwrap_or(false)
 }
 
@@ -254,7 +249,8 @@ fn print_info_formatted(label: &str, desc: &str) {
     println!("  {} {} — {}", "→".cyan(), label.bold(), desc.dimmed());
 }
 
-fn main() {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let filter = if cli.verbose { "debug" } else { "info" };
@@ -280,83 +276,99 @@ fn main() {
 
             let models_url = format!("{}/v1/models", upstream.trim_end_matches('/'));
 
-            match reqwest::blocking::Client::new()
-                .get(&models_url)
+            let client = match reqwest::Client::builder()
+                .no_proxy()
+                .connect_timeout(std::time::Duration::from_secs(3))
                 .timeout(std::time::Duration::from_secs(10))
-                .send()
+                .build()
             {
-                Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>() {
-                    Ok(data) => {
-                        if let Some(models) = data.get("data").and_then(|v| v.as_array()) {
-                            if models.is_empty() {
-                                println!("{} No models found", "[INFO]".yellow());
-                                return;
-                            }
+                Ok(client) => client,
+                Err(e) => {
+                    println!("{} Failed to create HTTP client: {}", "[ERROR]".red(), e);
+                    return Ok(());
+                }
+            };
 
-                            println!("  {}  {:<30}  {}", "#".dimmed(), "ID".bold(), "Name".bold());
-                            println!("  {}", "─".repeat(60).dimmed());
-
-                            for (i, m) in models.iter().enumerate() {
-                                let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-                                let name: String = match m
-                                    .get("name")
-                                    .or_else(|| m.get("display_name"))
-                                    .and_then(|v| v.as_str())
-                                {
-                                    Some(n) => n.to_string(),
-                                    None => id
-                                        .replace('-', " ")
-                                        .split_whitespace()
-                                        .map(|w| {
-                                            let mut c = w.chars();
-                                            match c.next() {
-                                                None => String::new(),
-                                                Some(ch) => format!(
-                                                    "{}{}",
-                                                    ch.to_uppercase().collect::<String>(),
-                                                    c.as_str()
-                                                ),
-                                            }
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .join(" "),
-                                };
+            match client.get(&models_url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<serde_json::Value>().await {
+                        Ok(data) => {
+                            if let Some(models) = data.get("data").and_then(|v| v.as_array()) {
+                                if models.is_empty() {
+                                    println!("{} No models found", "[INFO]".yellow());
+                                    return Ok(());
+                                }
 
                                 println!(
                                     "  {}  {:<30}  {}",
-                                    format!("[{}]", i + 1).dimmed(),
-                                    id.yellow(),
-                                    name
+                                    "#".dimmed(),
+                                    "ID".bold(),
+                                    "Name".bold()
                                 );
-                            }
+                                println!("  {}", "─".repeat(60).dimmed());
 
-                            println!();
-                            println!("{}", "Usage:".bold());
-                            println!(
-                                "  {}",
-                                "opencode run -m <id> \"Hello from OpenCode!\""
-                                    .bold()
-                                    .yellow()
-                            );
-                            println!();
-                            println!("{}", "Examples:".bold());
-                            for m in models.iter().take(3) {
-                                let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                                if !id.is_empty() {
+                                for (i, m) in models.iter().enumerate() {
+                                    let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let name: String = match m
+                                        .get("name")
+                                        .or_else(|| m.get("display_name"))
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        Some(n) => n.to_string(),
+                                        None => id
+                                            .replace('-', " ")
+                                            .split_whitespace()
+                                            .map(|w| {
+                                                let mut c = w.chars();
+                                                match c.next() {
+                                                    None => String::new(),
+                                                    Some(ch) => format!(
+                                                        "{}{}",
+                                                        ch.to_uppercase().collect::<String>(),
+                                                        c.as_str()
+                                                    ),
+                                                }
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(" "),
+                                    };
+
                                     println!(
-                                        "  {}",
-                                        format!("opencode run -m {} \"Hello\"", id).dimmed()
+                                        "  {}  {:<30}  {}",
+                                        format!("[{}]", i + 1).dimmed(),
+                                        id.yellow(),
+                                        name
                                     );
                                 }
+
+                                println!();
+                                println!("{}", "Usage:".bold());
+                                println!(
+                                    "  {}",
+                                    "opencode run -m <id> \"Hello from OpenCode!\""
+                                        .bold()
+                                        .yellow()
+                                );
+                                println!();
+                                println!("{}", "Examples:".bold());
+                                for m in models.iter().take(3) {
+                                    let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                    if !id.is_empty() {
+                                        println!(
+                                            "  {}",
+                                            format!("opencode run -m {} \"Hello\"", id).dimmed()
+                                        );
+                                    }
+                                }
+                            } else {
+                                println!("{} No 'data' field in response", "[ERROR]".red());
                             }
-                        } else {
-                            println!("{} No 'data' field in response", "[ERROR]".red());
+                        }
+                        Err(e) => {
+                            println!("{} Failed to parse response: {}", "[ERROR]".red(), e);
                         }
                     }
-                    Err(e) => {
-                        println!("{} Failed to parse response: {}", "[ERROR]".red(), e);
-                    }
-                },
+                }
                 Ok(resp) => {
                     println!(
                         "{} Upstream returned status: {}",
@@ -410,7 +422,7 @@ fn main() {
                 println!("{} Run to get started:", "Tip:".cyan().bold());
                 println!("  {}", "oplire proxies import <file>".bold().yellow());
                 println!("  {}", "oplire proxy".bold().yellow());
-                return;
+                return Ok(());
             }
 
             println!(
@@ -461,7 +473,7 @@ fn main() {
 
                 if check_opencode_installed() {
                     println!("{} OpenCode is already installed", "[INFO]".green());
-                    return;
+                    return Ok(());
                 }
 
                 if !check_node_installed() {
@@ -542,8 +554,7 @@ fn main() {
             };
 
             if let Some(ref p) = pool {
-                let rt_test = tokio::runtime::Runtime::new().unwrap();
-                if let Some(active) = rt_test.block_on(p.get_active()) {
+                if let Some(active) = p.get_active().await {
                     println!(
                         "{} Proxy Pool:  {} ({}:{})",
                         "→".green(),
@@ -567,21 +578,14 @@ fn main() {
             println!("{} Press Ctrl+C to stop", "Tip:".cyan());
             println!();
 
-            let upstream_clone = effective_upstream.clone();
-            let log_file_clone = log_file.clone();
-            let pool_clone = pool.clone();
-            let delay = *delay_ms;
-
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            if let Err(e) = rt.block_on(async {
-                oplire_reset::watch::start_watch_mode(
-                    &upstream_clone,
-                    log_file_clone,
-                    pool_clone,
-                    delay,
-                )
-                .await
-            }) {
+            if let Err(e) = oplire_reset::watch::start_watch_mode(
+                &effective_upstream,
+                log_file.clone(),
+                pool,
+                *delay_ms,
+            )
+            .await
+            {
                 eprintln!("{} Watch error: {}", "[ERROR]".red(), e);
                 std::process::exit(1);
             }
@@ -621,8 +625,7 @@ fn main() {
             };
 
             if let Some(ref p) = pool {
-                let rt_test = tokio::runtime::Runtime::new().unwrap();
-                if let Some(active) = rt_test.block_on(p.get_active()) {
+                if let Some(active) = p.get_active().await {
                     println!(
                         "{} Proxy Pool:  {} ({}:{})",
                         "→".green(),
@@ -640,23 +643,20 @@ fn main() {
             );
             println!();
 
-            let rt = tokio::runtime::Runtime::new().unwrap();
             let pool_watcher = pool.clone();
             let upstream_watcher = effective_upstream.clone();
 
-            if let Err(e) = rt.block_on(async {
-                tokio::spawn(async move {
-                    let _ = oplire_reset::watch::start_watch_mode(
-                        &upstream_watcher,
-                        None,
-                        pool_watcher,
-                        oplire_reset::watch::DEFAULT_DEBOUNCE_MS,
-                    )
-                    .await;
-                });
+            tokio::spawn(async move {
+                let _ = oplire_reset::watch::start_watch_mode(
+                    &upstream_watcher,
+                    None,
+                    pool_watcher,
+                    oplire_reset::watch::DEFAULT_DEBOUNCE_MS,
+                )
+                .await;
+            });
 
-                oplire_reset::proxy::start_proxy_server(effective_listen, pool).await
-            }) {
+            if let Err(e) = oplire_reset::proxy::start_proxy_server(effective_listen, pool).await {
                 eprintln!("{} Daemon error: {}", "[ERROR]".red(), e);
                 std::process::exit(1);
             }
@@ -679,7 +679,7 @@ fn main() {
 
             let config = load_config();
             let upstream = config.upstream.clone();
-            if check_opencode_running(&upstream) {
+            if check_opencode_running(&upstream).await {
                 checks.push(("OpenCode Zen", format!("running ({})", upstream), true));
             } else {
                 checks.push((
@@ -701,18 +701,15 @@ fn main() {
                 checks.push(("Config file", "using defaults".to_string(), true));
             }
 
-            if std::net::TcpListener::bind(config.listen.as_str()).is_ok() {
+            let listen_addr = oplire_reset::proxy::parse_listen_addr(&config.listen);
+            if std::net::TcpListener::bind(listen_addr).is_ok() {
                 checks.push((
                     "Listen address",
-                    format!("available ({})", config.listen),
+                    format!("available ({})", listen_addr),
                     true,
                 ));
             } else {
-                checks.push((
-                    "Listen address",
-                    format!("IN USE ({})", config.listen),
-                    false,
-                ));
+                checks.push(("Listen address", format!("IN USE ({})", listen_addr), false));
                 all_ok = false;
             }
 
@@ -816,8 +813,7 @@ fn main() {
             println!();
             println!("{} Listening on: {}", "→".green(), effective_listen.bold());
             if let Some(ref p) = pool {
-                let rt_test = tokio::runtime::Runtime::new().unwrap();
-                if let Some(active) = rt_test.block_on(p.get_active()) {
+                if let Some(active) = p.get_active().await {
                     println!(
                         "{} Proxy Pool:  {} ({}:{})",
                         "→".green(),
@@ -835,23 +831,20 @@ fn main() {
             );
             println!();
 
-            let rt = tokio::runtime::Runtime::new().unwrap();
             let pool_watcher = pool.clone();
             let upstream_watcher = effective_upstream.clone();
 
-            if let Err(e) = rt.block_on(async {
-                tokio::spawn(async move {
-                    let _ = oplire_reset::watch::start_watch_mode(
-                        &upstream_watcher,
-                        None,
-                        pool_watcher,
-                        oplire_reset::watch::DEFAULT_DEBOUNCE_MS,
-                    )
-                    .await;
-                });
+            tokio::spawn(async move {
+                let _ = oplire_reset::watch::start_watch_mode(
+                    &upstream_watcher,
+                    None,
+                    pool_watcher,
+                    oplire_reset::watch::DEFAULT_DEBOUNCE_MS,
+                )
+                .await;
+            });
 
-                oplire_reset::proxy::start_proxy_server(effective_listen, pool).await
-            }) {
+            if let Err(e) = oplire_reset::proxy::start_proxy_server(effective_listen, pool).await {
                 eprintln!("{} Proxy server error: {}", "[ERROR]".red(), e);
                 std::process::exit(1);
             }
@@ -864,84 +857,131 @@ fn main() {
                     println!("{}", "Residential & ISP Proxy Pool".bold().cyan());
                     println!();
                     let pool = ProxyPool::load_default();
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        let proxies = pool.proxies.read().await;
-                        if proxies.is_empty() {
-                            println!("{} No proxies configured in pool.", "[WARN]".yellow());
-                            println!("{} Import proxies with `oplire proxies import <file>` or place `proxiware-isp.txt` in current dir", "Tip:".cyan());
-                            return;
-                        }
-                        let active_idx = pool.active_index.load(std::sync::atomic::Ordering::SeqCst) % proxies.len();
-                        println!("{} Config path:   {}", "→".green(), ProxyPool::config_proxies_path().display().to_string().bold());
-                        println!("{} Total proxies: {}", "→".green(), proxies.len().to_string().bold());
-                        println!();
+                    let proxies = pool.proxies.read().await.clone();
+                    if proxies.is_empty() {
+                        println!("{} No proxies configured in pool.", "[WARN]".yellow());
+                        println!("{} Import proxies with `oplire proxies import <file>` or place `proxiware-isp.txt` in current dir", "Tip:".cyan());
+                        return Ok(());
+                    }
+                    let active_idx =
+                        pool.active_index.load(std::sync::atomic::Ordering::SeqCst) % proxies.len();
+                    println!(
+                        "{} Config path:   {}",
+                        "→".green(),
+                        ProxyPool::config_proxies_path()
+                            .display()
+                            .to_string()
+                            .bold()
+                    );
+                    println!(
+                        "{} Total proxies: {}",
+                        "→".green(),
+                        proxies.len().to_string().bold()
+                    );
+                    println!();
 
-                        println!("  {:<4} {:<8} {:<24} {:<15} Auth", "Act", "Index", "Host:Port", "Provider");
-                        println!("  {}", "─".repeat(65).dimmed());
+                    println!(
+                        "  {:<4} {:<8} {:<24} {:<15} Auth",
+                        "Act", "Index", "Host:Port", "Provider"
+                    );
+                    println!("  {}", "─".repeat(65).dimmed());
 
-                        for (i, p) in proxies.iter().enumerate() {
-                            let is_active = i == active_idx;
-                            let marker = if is_active { "★".green().bold() } else { " ".dimmed() };
-                            let idx_str = format!("[{}/{}]", i + 1, proxies.len());
-                            let hp = format!("{}:{}", p.host, p.port);
-                            let auth = if p.username.is_some() { "yes".green() } else { "none".dimmed() };
-                            if is_active {
-                                println!("  {:<4} {:<8} {:<24} {:<15} {}", marker, idx_str.green().bold(), hp.green().bold(), p.provider.green(), auth);
-                            } else {
-                                println!("  {:<4} {:<8} {:<24} {:<15} {}", marker, idx_str.dimmed(), hp, p.provider, auth);
-                            }
+                    for (i, p) in proxies.iter().enumerate() {
+                        let is_active = i == active_idx;
+                        let marker = if is_active {
+                            "★".green().bold()
+                        } else {
+                            " ".dimmed()
+                        };
+                        let idx_str = format!("[{}/{}]", i + 1, proxies.len());
+                        let hp = format!("{}:{}", p.host, p.port);
+                        let auth = if p.username.is_some() {
+                            "yes".green()
+                        } else {
+                            "none".dimmed()
+                        };
+                        if is_active {
+                            println!(
+                                "  {:<4} {:<8} {:<24} {:<15} {}",
+                                marker,
+                                idx_str.green().bold(),
+                                hp.green().bold(),
+                                p.provider.green(),
+                                auth
+                            );
+                        } else {
+                            println!(
+                                "  {:<4} {:<8} {:<24} {:<15} {}",
+                                marker,
+                                idx_str.dimmed(),
+                                hp,
+                                p.provider,
+                                auth
+                            );
                         }
-                        println!();
-                        println!("{} Rotate to next proxy with: {}", "Tip:".cyan(), "oplire proxies next".bold());
-                        println!("{} Test all proxies with:      {}", "Tip:".cyan(), "oplire proxies test".bold());
-                    });
+                    }
+                    println!();
+                    println!(
+                        "{} Rotate to next proxy with: {}",
+                        "Tip:".cyan(),
+                        "oplire proxies next".bold()
+                    );
+                    println!(
+                        "{} Test all proxies with:      {}",
+                        "Tip:".cyan(),
+                        "oplire proxies test".bold()
+                    );
                 }
                 ProxiesAction::Test {} => {
                     println!("{}", "Testing Proxy Pool Connectivity".bold().cyan());
                     println!();
                     let pool = ProxyPool::load_default();
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        let proxies = pool.proxies.read().await;
-                        if proxies.is_empty() {
-                            println!("{} No proxies to test in pool.", "[WARN]".yellow());
-                            return;
-                        }
-                        for (i, p) in proxies.iter().enumerate() {
-                            print!(
-                                "  [{}/{}] {}:{} ({})... ",
-                                i + 1,
-                                proxies.len(),
-                                p.host,
-                                p.port,
-                                p.provider
-                            );
-                            match pool.test_proxy(p).await {
-                                Ok((ip, elapsed)) => {
-                                    println!(
-                                        "{} Exit IP: {} ({}ms)",
-                                        "✓ OK".green().bold(),
-                                        ip.bold(),
-                                        elapsed.as_millis()
-                                    );
-                                }
-                                Err(e) => {
-                                    println!("{} Error: {}", "✗ FAIL".red().bold(), e);
-                                }
+                    let proxies = pool.proxies.read().await.clone();
+                    if proxies.is_empty() {
+                        println!("{} No proxies to test in pool.", "[WARN]".yellow());
+                        return Ok(());
+                    }
+                    for (i, p) in proxies.iter().enumerate() {
+                        print!(
+                            "  [{}/{}] {}:{} ({})... ",
+                            i + 1,
+                            proxies.len(),
+                            p.host,
+                            p.port,
+                            p.provider
+                        );
+                        match pool.test_proxy(p).await {
+                            Ok((ip, elapsed)) => {
+                                println!(
+                                    "{} Exit IP: {} ({}ms)",
+                                    "✓ OK".green().bold(),
+                                    ip.bold(),
+                                    elapsed.as_millis()
+                                );
+                            }
+                            Err(e) => {
+                                let message = e.to_string();
+                                let message = match p.password.as_deref() {
+                                    Some(password) if !password.is_empty() => {
+                                        message.replace(password, "***REDACTED***")
+                                    }
+                                    _ => message,
+                                };
+                                println!("{} Error: {}", "✗ FAIL".red().bold(), message);
                             }
                         }
-                        println!();
-                    });
+                    }
+                    println!();
                 }
                 ProxiesAction::Next {} => {
                     println!("{}", "Rotating Active Proxy".bold().cyan());
                     println!();
                     let pool = ProxyPool::load_default();
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        if let Some(p) = pool.rotate().await {
-                            let total = pool.proxies.read().await.len();
+                    if let Some(p) = pool.rotate().await {
+                        let total = pool.proxies.read().await.len();
+                        if total == 0 {
+                            println!("{} No proxies in pool to rotate", "[WARN]".yellow());
+                        } else {
                             let idx =
                                 pool.active_index.load(std::sync::atomic::Ordering::SeqCst) % total;
                             println!(
@@ -953,10 +993,10 @@ fn main() {
                                 p.host,
                                 p.port
                             );
-                        } else {
-                            println!("{} No proxies in pool to rotate", "[WARN]".yellow());
                         }
-                    });
+                    } else {
+                        println!("{} No proxies in pool to rotate", "[WARN]".yellow());
+                    }
                 }
                 ProxiesAction::Import { file } => {
                     println!("{}", "Importing Proxies".bold().cyan());
@@ -971,7 +1011,7 @@ fn main() {
                                 eprintln!("{} Failed to save proxies: {}", "[ERROR]".red(), e);
                                 std::process::exit(1);
                             }
-                            let count = futures::executor::block_on(pool.proxies.read()).len();
+                            let count = pool.proxies.read().await.len();
                             println!(
                                 "{} Successfully imported {} proxies to {}",
                                 "✓".green().bold(),
@@ -994,15 +1034,14 @@ fn main() {
                         "Fetching Static ISP Proxies from Proxiware".bold().cyan()
                     );
                     println!();
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    match rt.block_on(ProxyPool::fetch_from_proxiware_api(api_key)) {
+                    match ProxyPool::fetch_from_proxiware_api(api_key.as_str()).await {
                         Ok(proxies) => {
                             let pool = ProxyPool::new(proxies);
                             if let Err(e) = pool.save_to_config() {
                                 eprintln!("{} Failed to save proxies: {}", "[ERROR]".red(), e);
                                 std::process::exit(1);
                             }
-                            let count = futures::executor::block_on(pool.proxies.read()).len();
+                            let count = pool.proxies.read().await.len();
                             println!(
                                 "{} Successfully fetched {} ISP proxies and saved to {}",
                                 "✓".green().bold(),
@@ -1086,4 +1125,6 @@ fn main() {
     ) {
         println!("\n{} v{}", "oplire".bold(), VERSION.dimmed());
     }
+
+    Ok(())
 }

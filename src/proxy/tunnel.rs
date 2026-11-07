@@ -1,11 +1,200 @@
 //! HTTP CONNECT tunnel establishment, Basic Auth header injection, and rotation teardown.
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
-use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::net::{lookup_host, TcpStream};
+use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use crate::pool::ProxyPool;
+use crate::proxy::server::find_double_crlf;
+
+const CLIENT_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+const UPSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(8);
+const MAX_CLIENT_HEADER_BYTES: usize = 8_192;
+const MAX_UPSTREAM_HEADER_BYTES: usize = 4_096;
+const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
+const ERROR_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Debug, PartialEq, Eq)]
+enum HeaderError {
+    Eof,
+    TooLarge,
+    Timeout,
+    Io,
+}
+
+async fn read_headers_bounded<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    max_len: usize,
+    timeout_dur: Duration,
+) -> Result<(Vec<u8>, usize), HeaderError> {
+    let read_fut = async {
+        let mut buf = Vec::with_capacity(1024);
+        let mut temp = [0u8; 1024];
+
+        loop {
+            let search_start = buf.len().saturating_sub(3);
+            match stream.read(&mut temp).await {
+                Ok(0) => return Err(HeaderError::Eof),
+                Ok(n) => {
+                    buf.extend_from_slice(&temp[..n]);
+                    if let Some(relative_pos) = find_double_crlf(&buf[search_start..]) {
+                        return Ok((buf, search_start + relative_pos));
+                    }
+                    if buf.len() > max_len {
+                        return Err(HeaderError::TooLarge);
+                    }
+                }
+                Err(_) => return Err(HeaderError::Io),
+            }
+        }
+    };
+
+    match tokio::time::timeout(timeout_dur, read_fut).await {
+        Ok(result) => result,
+        Err(_) => Err(HeaderError::Timeout),
+    }
+}
+
+/// Validate a CONNECT target against SSRF and DNS-rebinding attacks.
+pub async fn validate_connect_target(target: &str) -> bool {
+    resolve_and_validate_target(target).await.is_ok()
+}
+
+async fn resolve_and_validate_target(target: &str) -> Result<Vec<SocketAddr>, &'static str> {
+    if target.is_empty() {
+        return Err("empty target");
+    }
+    if target.bytes().any(|b| !(0x21..=0x7e).contains(&b)) {
+        return Err("invalid characters");
+    }
+
+    let (host, port_str) = target.rsplit_once(':').ok_or("missing port")?;
+    let port = port_str.parse::<u16>().map_err(|_| "invalid port")?;
+    if port == 0 {
+        return Err("port zero");
+    }
+
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.is_empty() || host.len() > 253 {
+        return Err("invalid host");
+    }
+    if host
+        .bytes()
+        .any(|b| matches!(b, b'/' | b'\\' | b'@' | b'?' | b'#' | b'%' | b'[' | b']'))
+    {
+        return Err("invalid host");
+    }
+
+    let lower = host.trim_end_matches('.').to_ascii_lowercase();
+    if lower == "localhost"
+        || lower.ends_with(".localhost")
+        || lower.ends_with(".local")
+        || lower.ends_with(".internal")
+    {
+        return Err("forbidden hostname");
+    }
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_forbidden_ip(ip) {
+            return Err("forbidden address");
+        }
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+
+    let resolved = tokio::time::timeout(DNS_LOOKUP_TIMEOUT, lookup_host((host, port)))
+        .await
+        .map_err(|_| "dns timeout")?
+        .map_err(|_| "dns failure")?
+        .collect::<Vec<_>>();
+
+    if resolved.is_empty() {
+        return Err("no addresses");
+    }
+    if resolved.iter().any(|addr| is_forbidden_ip(addr.ip())) {
+        return Err("forbidden resolved address");
+    }
+
+    Ok(resolved)
+}
+
+fn is_forbidden_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_forbidden_ipv4(v4),
+        IpAddr::V6(v6) => {
+            if v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6.is_multicast()
+            {
+                return true;
+            }
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_forbidden_ipv4(v4);
+            }
+            let segments = v6.segments();
+            segments[0] == 0x2001 && segments[1] == 0x0db8
+        }
+    }
+}
+
+fn is_forbidden_ipv4(v4: Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+        || v4.is_unspecified()
+        || v4.is_documentation()
+        || octets[0] == 0
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        || octets[0] >= 240
+}
+
+async fn send_error(stream: &mut TcpStream, status: &str) {
+    let response = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let _ = tokio::time::timeout(ERROR_WRITE_TIMEOUT, stream.write_all(response.as_bytes())).await;
+    let _ = stream.shutdown().await;
+}
+
+async fn relay_until_rotation(
+    mut client: TcpStream,
+    mut upstream: TcpStream,
+    rotation_rx: &mut broadcast::Receiver<usize>,
+    target: &str,
+) {
+    tokio::select! {
+        res = copy_bidirectional(&mut client, &mut upstream) => {
+            if let Err(e) = res {
+                debug!("Tunnel {} finished: {}", target, e);
+            }
+        }
+        rot = rotation_rx.recv() => {
+            match rot {
+                Ok(idx) => info!(
+                    "Proxy rotated to index {}: aborting active CONNECT tunnel to {}",
+                    idx + 1,
+                    target
+                ),
+                Err(broadcast::error::RecvError::Lagged(n)) => warn!(
+                    "Rotation receiver lagged by {} events: aborting active CONNECT tunnel to {}",
+                    n, target
+                ),
+                Err(broadcast::error::RecvError::Closed) => warn!(
+                    "Rotation channel closed: aborting active CONNECT tunnel to {}",
+                    target
+                ),
+            }
+            let _ = client.shutdown().await;
+            let _ = upstream.shutdown().await;
+        }
+    }
+}
 
 /// Process an incoming HTTP CONNECT tunnel request from a client (e.g. OpenCode CLI/Desktop).
 ///
@@ -13,38 +202,42 @@ use crate::pool::ProxyPool;
 /// to the target if no proxy is configured. When a rotation occurs, active tunnels receive
 /// a termination signal to force client reconnect.
 pub async fn handle_connect_tunnel(mut client: TcpStream, pool: ProxyPool) {
-    let mut req_buf = Vec::new();
-    let mut temp = [0u8; 1024];
+    // Subscribe before selecting a proxy to eliminate the TOCTOU rotation window.
+    let mut rotation_rx = pool.subscribe_rotation();
 
-    // Read HTTP request headers until \r\n\r\n
-    let target = loop {
-        match client.read(&mut temp).await {
-            Ok(0) => return,
-            Ok(n) => {
-                req_buf.extend_from_slice(&temp[..n]);
-                if let Some(pos) = find_double_crlf(&req_buf) {
-                    let header_str = String::from_utf8_lossy(&req_buf[..pos]);
-                    let first_line = header_str.lines().next().unwrap_or("");
-                    let parts: Vec<&str> = first_line.split_whitespace().collect();
-                    if parts.len() >= 2 && parts[0].eq_ignore_ascii_case("CONNECT") {
-                        break parts[1].to_string();
-                    } else {
-                        warn!("Invalid CONNECT request: {}", first_line);
-                        let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
-                        return;
-                    }
-                }
-                if req_buf.len() > 8192 {
-                    let _ = client
-                        .write_all(b"HTTP/1.1 413 Payload Too Large\r\n\r\n")
-                        .await;
-                    return;
-                }
-            }
-            Err(e) => {
-                debug!("Client read error before CONNECT: {}", e);
+    let (req_buf, req_end) =
+        match read_headers_bounded(&mut client, MAX_CLIENT_HEADER_BYTES, CLIENT_HEADER_TIMEOUT)
+            .await
+        {
+            Ok(result) => result,
+            Err(HeaderError::TooLarge) => {
+                send_error(&mut client, "413 Payload Too Large").await;
                 return;
             }
+            Err(HeaderError::Timeout) => {
+                send_error(&mut client, "408 Request Timeout").await;
+                return;
+            }
+            Err(HeaderError::Eof) | Err(HeaderError::Io) => return,
+        };
+
+    let header_str = String::from_utf8_lossy(&req_buf[..req_end]);
+    let first_line = header_str.lines().next().unwrap_or("");
+    let parts: Vec<&str> = first_line.split_whitespace().collect();
+
+    if parts.len() < 2 || !parts[0].eq_ignore_ascii_case("CONNECT") {
+        warn!("Invalid CONNECT request: {:?}", first_line);
+        send_error(&mut client, "400 Bad Request").await;
+        return;
+    }
+
+    let target = parts[1].to_string();
+    let resolved = match resolve_and_validate_target(&target).await {
+        Ok(addresses) => addresses,
+        Err(reason) => {
+            warn!("Rejected CONNECT target {:?}: {}", target, reason);
+            send_error(&mut client, "403 Forbidden").await;
+            return;
         }
     };
 
@@ -52,185 +245,204 @@ pub async fn handle_connect_tunnel(mut client: TcpStream, pool: ProxyPool) {
 
     match active_proxy {
         Some(proxy) => {
+            if !proxy.protocol.eq_ignore_ascii_case("http") {
+                warn!(
+                    "Unsupported upstream proxy protocol '{}' for {}:{}",
+                    proxy.protocol, proxy.host, proxy.port
+                );
+                send_error(&mut client, "502 Bad Gateway").await;
+                return;
+            }
+
             let proxy_addr = format!("{}:{}", proxy.host, proxy.port);
             debug!("Tunneling CONNECT {} via proxy {}", target, proxy_addr);
 
-            let mut upstream =
-                match tokio::time::timeout(Duration::from_secs(8), TcpStream::connect(&proxy_addr))
-                    .await
-                {
-                    Ok(Ok(stream)) => stream,
-                    Ok(Err(e)) => {
-                        warn!("Failed to connect to upstream proxy {}: {}", proxy_addr, e);
-                        let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                        return;
-                    }
-                    Err(_) => {
-                        warn!("Timeout connecting to upstream proxy {}", proxy_addr);
-                        let _ = client
-                            .write_all(b"HTTP/1.1 504 Gateway Timeout\r\n\r\n")
-                            .await;
-                        return;
-                    }
-                };
+            let mut upstream = match tokio::time::timeout(
+                UPSTREAM_CONNECT_TIMEOUT,
+                TcpStream::connect((proxy.host.as_str(), proxy.port)),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => {
+                    warn!("Failed to connect to upstream proxy {}: {}", proxy_addr, e);
+                    send_error(&mut client, "502 Bad Gateway").await;
+                    return;
+                }
+                Err(_) => {
+                    warn!("Timeout connecting to upstream proxy {}", proxy_addr);
+                    send_error(&mut client, "504 Gateway Timeout").await;
+                    return;
+                }
+            };
 
-            // Build CONNECT request to upstream proxy
             let mut upstream_req = format!("CONNECT {} HTTP/1.1\r\nHost: {}\r\n", target, target);
             if let Some(auth_header) = proxy.basic_auth_header() {
                 upstream_req.push_str(&format!("Proxy-Authorization: {}\r\n", auth_header));
             }
             upstream_req.push_str("Proxy-Connection: Keep-Alive\r\n\r\n");
 
-            if let Err(e) = upstream.write_all(upstream_req.as_bytes()).await {
-                warn!("Failed to write CONNECT to upstream proxy: {}", e);
-                let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                return;
+            let write_result = tokio::time::timeout(
+                UPSTREAM_HEADER_TIMEOUT,
+                upstream.write_all(upstream_req.as_bytes()),
+            )
+            .await;
+
+            match write_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!("Failed to write CONNECT to upstream proxy: {}", e);
+                    send_error(&mut client, "502 Bad Gateway").await;
+                    return;
+                }
+                Err(_) => {
+                    warn!("Timeout writing CONNECT to upstream proxy {}", proxy_addr);
+                    send_error(&mut client, "504 Gateway Timeout").await;
+                    return;
+                }
             }
 
-            // Read response from upstream proxy
-            let mut resp_buf = Vec::new();
-            let mut u_temp = [0u8; 1024];
-
-            let success = loop {
-                match upstream.read(&mut u_temp).await {
-                    Ok(0) => break false,
-                    Ok(n) => {
-                        resp_buf.extend_from_slice(&u_temp[..n]);
-                        if let Some(pos) = find_double_crlf(&resp_buf) {
-                            let resp_header = String::from_utf8_lossy(&resp_buf[..pos]);
-                            let first_line = resp_header.lines().next().unwrap_or("");
-                            if first_line.contains("200") {
-                                break true;
-                            } else {
-                                warn!("Upstream proxy rejected CONNECT {}: {}", target, first_line);
-                                break false;
-                            }
-                        }
-                        if resp_buf.len() > 4096 {
-                            break false;
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Error reading upstream proxy CONNECT response: {}", e);
-                        break false;
-                    }
+            let (resp_buf, resp_end) = match read_headers_bounded(
+                &mut upstream,
+                MAX_UPSTREAM_HEADER_BYTES,
+                UPSTREAM_HEADER_TIMEOUT,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(HeaderError::Timeout) => {
+                    warn!("Timeout reading CONNECT response from {}", proxy_addr);
+                    send_error(&mut client, "504 Gateway Timeout").await;
+                    return;
+                }
+                Err(_) => {
+                    send_error(&mut client, "502 Bad Gateway").await;
+                    return;
                 }
             };
 
-            if success {
-                if let Err(e) = client
-                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                    .await
-                {
-                    debug!("Failed to send 200 Connection Established to client: {}", e);
-                    return;
-                }
+            let resp_header = String::from_utf8_lossy(&resp_buf[..resp_end]);
+            let status_line = resp_header.lines().next().unwrap_or("");
+            let status_code = status_line.split_whitespace().nth(1).unwrap_or("");
 
-                // Transfer buffered bytes from client and upstream proxy if any
-                if let Some(req_end) = find_double_crlf(&req_buf) {
-                    if req_end < req_buf.len() {
-                        if let Err(e) = upstream.write_all(&req_buf[req_end..]).await {
-                            debug!("Failed to write buffered client bytes to upstream: {}", e);
-                            return;
-                        }
-                    }
-                }
-                if let Some(resp_end) = find_double_crlf(&resp_buf) {
-                    if resp_end < resp_buf.len() {
-                        if let Err(e) = client.write_all(&resp_buf[resp_end..]).await {
-                            debug!("Failed to write buffered upstream bytes to client: {}", e);
-                            return;
-                        }
-                    }
-                }
-
-                info!(
-                    "Tunnel established: {} ↔ {} ({})",
-                    target, proxy.host, proxy.provider
+            if status_code != "200" {
+                warn!(
+                    "Upstream proxy rejected CONNECT {}: {}",
+                    target, status_line
                 );
-                let mut rotation_rx = pool.subscribe_rotation();
-                tokio::select! {
-                    res = copy_bidirectional(&mut client, &mut upstream) => {
-                        if let Err(e) = res {
-                            debug!("Tunnel {} finished: {}", target, e);
-                        }
-                    }
-                    Ok(new_idx) = rotation_rx.recv() => {
-                        info!(
-                            "Proxy rotated to index {}: aborting active CONNECT tunnel to {} to force client reconnection",
-                            new_idx + 1,
-                            target
-                        );
-                    }
-                }
-            } else {
-                let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-            }
-        }
-        None => {
-            // Direct connect without upstream proxy
-            debug!("Direct CONNECT tunnel to {}", target);
-            let mut upstream =
-                match tokio::time::timeout(Duration::from_secs(8), TcpStream::connect(&target))
-                    .await
-                {
-                    Ok(Ok(stream)) => stream,
-                    Ok(Err(e)) => {
-                        warn!("Direct connect to {} failed: {}", target, e);
-                        let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                        return;
-                    }
-                    Err(_) => {
-                        warn!("Timeout connecting directly to {}", target);
-                        let _ = client
-                            .write_all(b"HTTP/1.1 504 Gateway Timeout\r\n\r\n")
-                            .await;
-                        return;
-                    }
-                };
-
-            if let Err(e) = client
-                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                .await
-            {
-                debug!("Failed to send 200 Connection Established to client: {}", e);
+                send_error(&mut client, "502 Bad Gateway").await;
                 return;
             }
 
-            if let Some(req_end) = find_double_crlf(&req_buf) {
-                if req_end < req_buf.len() {
-                    if let Err(e) = upstream.write_all(&req_buf[req_end..]).await {
-                        debug!("Failed to write buffered client bytes to upstream: {}", e);
-                        return;
-                    }
+            if client
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            if req_end < req_buf.len() && upstream.write_all(&req_buf[req_end..]).await.is_err() {
+                return;
+            }
+            if resp_end < resp_buf.len() && client.write_all(&resp_buf[resp_end..]).await.is_err() {
+                return;
+            }
+
+            info!(
+                "Tunnel established: {} ↔ {} ({})",
+                target, proxy.host, proxy.provider
+            );
+            relay_until_rotation(client, upstream, &mut rotation_rx, &target).await;
+        }
+        None => {
+            debug!("Direct CONNECT tunnel to {}", target);
+
+            let mut upstream = match tokio::time::timeout(
+                UPSTREAM_CONNECT_TIMEOUT,
+                TcpStream::connect(&resolved[..]),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => {
+                    warn!("Direct connect to {} failed: {}", target, e);
+                    send_error(&mut client, "502 Bad Gateway").await;
+                    return;
                 }
+                Err(_) => {
+                    warn!("Timeout connecting directly to {}", target);
+                    send_error(&mut client, "504 Gateway Timeout").await;
+                    return;
+                }
+            };
+
+            if client
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            if req_end < req_buf.len() && upstream.write_all(&req_buf[req_end..]).await.is_err() {
+                return;
             }
 
             info!("Direct tunnel established: {}", target);
-            let mut rotation_rx = pool.subscribe_rotation();
-            tokio::select! {
-                res = copy_bidirectional(&mut client, &mut upstream) => {
-                    if let Err(e) = res {
-                        debug!("Direct tunnel {} finished: {}", target, e);
-                    }
-                }
-                Ok(new_idx) = rotation_rx.recv() => {
-                    info!(
-                        "Proxy rotated to index {}: aborting active direct CONNECT tunnel to {} to force client reconnection",
-                        new_idx + 1,
-                        target
-                    );
-                }
-            }
+            relay_until_rotation(client, upstream, &mut rotation_rx, &target).await;
         }
     }
 }
 
-fn find_double_crlf(buf: &[u8]) -> Option<usize> {
-    for i in 0..buf.len().saturating_sub(3) {
-        if &buf[i..i + 4] == b"\r\n\r\n" {
-            return Some(i + 4);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn test_ssrf_target_validation() {
+        let forbidden = [
+            "127.0.0.1:8080",
+            "localhost:3000",
+            "169.254.169.254:80",
+            "192.168.1.1:443",
+            "10.0.0.1:80",
+            "172.16.0.1:80",
+            "100.64.0.1:80",
+            "[::1]:8080",
+            "[::ffff:127.0.0.1]:80",
+            "evil.local:443",
+            "evil.internal:443",
+            "evil.com:443\r\nX-Injected: 1",
+            "evil.com:443 X",
+            "evil.com:0",
+            "",
+        ];
+
+        for target in forbidden {
+            assert!(
+                !validate_connect_target(target).await,
+                "target should be rejected: {target:?}"
+            );
         }
+
+        assert!(validate_connect_target("1.1.1.1:443").await);
+        assert!(validate_connect_target("8.8.8.8:53").await);
     }
-    None
+
+    #[tokio::test]
+    async fn test_read_headers_bounded_timeout() {
+        let (mut reader, _writer) = duplex(64);
+        let result = read_headers_bounded(&mut reader, 1024, Duration::from_millis(20)).await;
+        assert_eq!(result.unwrap_err(), HeaderError::Timeout);
+    }
+
+    #[tokio::test]
+    async fn test_read_headers_bounded_too_large() {
+        let (mut reader, mut writer) = duplex(4096);
+        writer.write_all(&vec![b'a'; 2048]).await.unwrap();
+        let result = read_headers_bounded(&mut reader, 1024, Duration::from_secs(1)).await;
+        assert_eq!(result.unwrap_err(), HeaderError::TooLarge);
+    }
 }

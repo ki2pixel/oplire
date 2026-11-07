@@ -6,14 +6,16 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::info;
 
+const FS_CHECK_INTERVAL_MS: u64 = 1_000;
+
 /// Representation of a single proxy upstream destination.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ProxyEntry {
     /// Proxy IP or domain hostname
     pub host: String,
@@ -29,6 +31,22 @@ pub struct ProxyEntry {
     pub protocol: String, // "http" or "socks5"
 }
 
+impl std::fmt::Debug for ProxyEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyEntry")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field(
+                "password",
+                &self.password.as_ref().map(|_| "***REDACTED***"),
+            )
+            .field("provider", &self.provider)
+            .field("protocol", &self.protocol)
+            .finish()
+    }
+}
+
 impl ProxyEntry {
     /// Parse a proxy line from various formats:
     /// - `host:port:username:password`
@@ -41,8 +59,8 @@ impl ProxyEntry {
             return None;
         }
 
-        // Support inline comments/tags: e.g. "188.220.163.167:1337:user:pass # proxiware-isp"
-        let (clean_line, tag) = if let Some((before, after)) = line.split_once('#') {
+        // Only a whitespace-prefixed '#' starts a tag, so passwords may contain '#'.
+        let (clean_line, tag) = if let Some((before, after)) = line.split_once(" #") {
             (before.trim(), Some(after.trim()))
         } else {
             (line, None)
@@ -96,8 +114,9 @@ impl ProxyEntry {
             }
         }
 
-        // Case 2: host:port:user:pass (Standard Proxiware & Webshare format)
-        let parts: Vec<&str> = clean_line.split(':').collect();
+        // Case 2: host:port:user:pass (Standard Proxiware & Webshare format).
+        // splitn(4) preserves passwords containing ':'.
+        let parts: Vec<&str> = clean_line.splitn(4, ':').collect();
         match parts.len() {
             4 => {
                 let host = parts[0].to_string();
@@ -177,11 +196,15 @@ pub struct ProxyPool {
     /// Atomic index of the currently active proxy
     pub active_index: Arc<AtomicUsize>,
     /// Last recorded modification timestamp of proxies.txt
-    pub last_mtime: Arc<RwLock<Option<std::time::SystemTime>>>,
+    pub last_mtime: Arc<RwLock<Option<SystemTime>>>,
     /// Last recorded modification timestamp of active_proxy.idx
-    pub last_index_mtime: Arc<RwLock<Option<std::time::SystemTime>>>,
+    pub last_index_mtime: Arc<RwLock<Option<SystemTime>>>,
     /// Broadcast channel transmitting index change events on rotation
     pub rotation_tx: tokio::sync::broadcast::Sender<usize>,
+    /// Directory holding proxies.txt, active_proxy.idx and config.json
+    config_dir: Arc<PathBuf>,
+    /// Throttles filesystem metadata checks to at most once per second
+    last_fs_check_ms: Arc<AtomicU64>,
 }
 
 impl Default for ProxyPool {
@@ -193,15 +216,25 @@ impl Default for ProxyPool {
 impl ProxyPool {
     /// Create a new ProxyPool with initial proxies and load persistent active index if available.
     pub fn new(proxies: Vec<ProxyEntry>) -> Self {
-        let saved_idx = Self::read_saved_index();
+        Self::with_config_dir(proxies, Self::config_dir())
+    }
+
+    /// Create a pool backed by an explicit configuration directory.
+    ///
+    /// This keeps tests hermetic and lets embedders avoid the default user profile.
+    pub fn with_config_dir(proxies: Vec<ProxyEntry>, config_dir: PathBuf) -> Self {
+        let config_dir = Arc::new(config_dir);
+        let proxies_path = config_dir.join("proxies.txt");
+        let idx_path = config_dir.join("active_proxy.idx");
+        let saved_idx = read_saved_index_from(&idx_path);
         let idx = if proxies.is_empty() {
             0
         } else {
             saved_idx % proxies.len()
         };
-        let path = Self::config_proxies_path();
-        let mtime = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
-        let idx_path = Self::index_file_path();
+        let mtime = fs::metadata(&proxies_path)
+            .ok()
+            .and_then(|m| m.modified().ok());
         let idx_mtime = fs::metadata(&idx_path).ok().and_then(|m| m.modified().ok());
         let (rotation_tx, _) = tokio::sync::broadcast::channel(32);
 
@@ -211,6 +244,8 @@ impl ProxyPool {
             last_mtime: Arc::new(RwLock::new(mtime)),
             last_index_mtime: Arc::new(RwLock::new(idx_mtime)),
             rotation_tx,
+            config_dir,
+            last_fs_check_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -218,50 +253,67 @@ impl ProxyPool {
         self.rotation_tx.subscribe()
     }
 
+    /// Return the platform configuration directory for oplire.
+    pub fn config_dir() -> PathBuf {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(home) = std::env::var_os("HOME") {
+                return PathBuf::from(home)
+                    .join("Library")
+                    .join("Application Support")
+                    .join("oplire");
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(appdata) = std::env::var_os("APPDATA") {
+                return PathBuf::from(appdata).join("oplire");
+            }
+            if let Some(profile) = std::env::var_os("USERPROFILE") {
+                return PathBuf::from(profile).join(".config").join("oplire");
+            }
+        }
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+            return PathBuf::from(xdg).join("oplire");
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(".config").join("oplire");
+        }
+        // Never fall back to "." (VULN-07).
+        PathBuf::from(".config").join("oplire")
+    }
+
     pub fn config_proxies_path() -> PathBuf {
-        let mut path = if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-            PathBuf::from(xdg)
-        } else if let Ok(home) = std::env::var("HOME") {
-            PathBuf::from(home).join(".config")
-        } else {
-            PathBuf::from(".")
-        };
-        path.push("oplire");
-        let _ = fs::create_dir_all(&path);
-        path.push("proxies.txt");
-        path
+        Self::config_dir().join("proxies.txt")
     }
 
-    fn index_file_path() -> PathBuf {
-        let mut path = Self::config_proxies_path();
-        path.set_file_name("active_proxy.idx");
-        path
+    fn proxies_path(&self) -> PathBuf {
+        self.config_dir.join("proxies.txt")
     }
 
-    fn read_saved_index() -> usize {
-        let path = Self::index_file_path();
-        if path.exists() {
-            if let Ok(content) = fs::read_to_string(&path) {
-                if let Ok(idx) = content.trim().parse::<usize>() {
-                    return idx;
-                }
+    fn index_file_path(&self) -> PathBuf {
+        self.config_dir.join("active_proxy.idx")
+    }
+
+    async fn read_saved_index_async(&self) -> usize {
+        let path = self.index_file_path();
+        tokio::fs::read_to_string(path)
+            .await
+            .ok()
+            .and_then(|content| content.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+    }
+
+    async fn save_index_async(&self, idx: usize) {
+        let path = self.index_file_path();
+        if let Some(parent) = path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = tokio::fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).await;
             }
         }
-        0
-    }
-
-    async fn read_saved_index_async() -> usize {
-        let path = Self::index_file_path();
-        if let Ok(content) = tokio::fs::read_to_string(&path).await {
-            if let Ok(idx) = content.trim().parse::<usize>() {
-                return idx;
-            }
-        }
-        0
-    }
-
-    async fn save_index_async(idx: usize) {
-        let path = Self::index_file_path();
         let _ = tokio::fs::write(path, idx.to_string()).await;
     }
 
@@ -353,51 +405,72 @@ impl ProxyPool {
     }
 
     pub fn save_to_config(&self) -> Result<()> {
-        let path = Self::config_proxies_path();
-        let guard = self
-            .proxies
-            .try_read()
-            .map_err(|_| anyhow!("Could not acquire read lock on proxies pool"))?;
-        let mut lines = Vec::new();
-        for p in guard.iter() {
-            lines.push(p.to_line());
-        }
-        fs::write(path, lines.join("\n"))?;
-        Ok(())
+        let path = self.proxies_path();
+        let content = {
+            let guard = self
+                .proxies
+                .try_read()
+                .map_err(|_| anyhow!("Could not acquire read lock on proxies pool"))?;
+            let mut lines = Vec::with_capacity(guard.len());
+            for proxy in guard.iter() {
+                lines.push(proxy.to_line());
+            }
+            lines.join("\n")
+        };
+        write_restricted_file(&path, &content)
     }
 
     pub async fn reload_if_modified(&self) {
-        let path = Self::config_proxies_path();
-        if let Ok(meta) = tokio::fs::metadata(&path).await {
+        let now = now_millis();
+        let last = self.last_fs_check_ms.load(Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < FS_CHECK_INTERVAL_MS {
+            return;
+        }
+        if self
+            .last_fs_check_ms
+            .compare_exchange(last, now, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let proxies_path = self.proxies_path();
+        if let Ok(meta) = tokio::fs::metadata(&proxies_path).await {
             if let Ok(current_mtime) = meta.modified() {
                 let should_reload = {
                     let guard = self.last_mtime.read().await;
                     match *guard {
-                        Some(last) => current_mtime > last,
+                        Some(last_mtime) => current_mtime > last_mtime,
                         None => true,
                     }
                 };
 
                 if should_reload {
-                    if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                        let mut list = Vec::new();
-                        for line in content.lines() {
-                            if let Some(entry) = ProxyEntry::parse(line, "custom") {
-                                list.push(entry);
-                            }
-                        }
+                    if let Ok(content) = tokio::fs::read_to_string(&proxies_path).await {
+                        let list: Vec<ProxyEntry> = content
+                            .lines()
+                            .filter_map(|line| ProxyEntry::parse(line, "custom"))
+                            .collect();
                         if !list.is_empty() {
-                            let mut p_guard = self.proxies.write().await;
-                            *p_guard = list;
-                            let mut m_guard = self.last_mtime.write().await;
-                            *m_guard = Some(current_mtime);
-                            let saved_idx = Self::read_saved_index_async().await;
-                            self.active_index.store(saved_idx, Ordering::SeqCst);
-                            let _ = self.rotation_tx.send(saved_idx);
+                            let new_len = list.len();
+                            let saved_idx = self.read_saved_index_async().await;
+                            let effective_idx = saved_idx % new_len;
+
+                            {
+                                let mut guard = self.proxies.write().await;
+                                *guard = list;
+                            }
+                            {
+                                let mut guard = self.last_mtime.write().await;
+                                *guard = Some(current_mtime);
+                            }
+
+                            self.active_index.store(effective_idx, Ordering::SeqCst);
+                            let _ = self.rotation_tx.send(effective_idx);
                             info!(
                                 "Auto-reloaded {} proxies from {}",
-                                p_guard.len(),
-                                path.display()
+                                new_len,
+                                proxies_path.display()
                             );
                         }
                     }
@@ -405,26 +478,40 @@ impl ProxyPool {
             }
         }
 
-        let idx_path = Self::index_file_path();
+        let idx_path = self.index_file_path();
         if let Ok(meta) = tokio::fs::metadata(&idx_path).await {
             if let Ok(current_mtime) = meta.modified() {
                 let should_reload_idx = {
                     let guard = self.last_index_mtime.read().await;
                     match *guard {
-                        Some(last) => current_mtime > last,
+                        Some(last_mtime) => current_mtime > last_mtime,
                         None => true,
                     }
                 };
 
                 if should_reload_idx {
-                    let mut m_guard = self.last_index_mtime.write().await;
-                    *m_guard = Some(current_mtime);
-                    let saved_idx = Self::read_saved_index_async().await;
-                    let current = self.active_index.load(Ordering::SeqCst);
-                    if current != saved_idx {
-                        self.active_index.store(saved_idx, Ordering::SeqCst);
-                        let _ = self.rotation_tx.send(saved_idx);
-                        info!("Active proxy index updated from disk to {}", saved_idx + 1);
+                    let saved_idx = self.read_saved_index_async().await;
+                    let total = {
+                        let guard = self.proxies.read().await;
+                        guard.len()
+                    };
+
+                    if total > 0 {
+                        let effective_idx = saved_idx % total;
+                        let current_idx = self.active_index.load(Ordering::SeqCst) % total;
+                        if current_idx != effective_idx {
+                            self.active_index.store(effective_idx, Ordering::SeqCst);
+                            let _ = self.rotation_tx.send(effective_idx);
+                            info!(
+                                "Active proxy index updated from disk to {}",
+                                effective_idx + 1
+                            );
+                        }
+                    }
+
+                    {
+                        let mut guard = self.last_index_mtime.write().await;
+                        *guard = Some(current_mtime);
                     }
                 }
             }
@@ -438,47 +525,60 @@ impl ProxyPool {
         if guard.is_empty() {
             return None;
         }
-        let idx = self.active_index.load(Ordering::Relaxed) % guard.len();
+        let idx = self.active_index.load(Ordering::SeqCst) % guard.len();
         guard.get(idx).cloned()
     }
 
     pub async fn rotate(&self) -> Option<ProxyEntry> {
         self.reload_if_modified().await;
 
-        let guard = self.proxies.read().await;
-        if guard.len() <= 1 {
-            if guard.is_empty() {
-                tracing::warn!("Cannot rotate: proxy pool is empty");
-            } else {
-                tracing::warn!(
-                    "Cannot rotate: proxy pool only has 1 proxy ({}:{})",
-                    guard[0].host,
-                    guard[0].port
-                );
+        let (next_idx, total, entry) = {
+            let guard = self.proxies.read().await;
+            if guard.len() <= 1 {
+                if guard.is_empty() {
+                    tracing::warn!("Cannot rotate: proxy pool is empty");
+                } else {
+                    tracing::warn!(
+                        "Cannot rotate: proxy pool only has 1 proxy ({}:{})",
+                        guard[0].host,
+                        guard[0].port
+                    );
+                }
+                return None;
             }
-            return None;
-        }
-        let total = guard.len();
-        let current_idx = self.active_index.load(Ordering::SeqCst);
-        let next_idx = (current_idx + 1) % total;
-        self.active_index.store(next_idx, Ordering::SeqCst);
-        Self::save_index_async(next_idx).await;
+            let total = guard.len();
+            let prev = self.active_index.fetch_add(1, Ordering::SeqCst);
+            let next_idx = prev.wrapping_add(1) % total;
+            (next_idx, total, guard.get(next_idx).cloned())
+        };
 
-        // Broadcast rotation event to interrupt existing CONNECT tunnels
+        self.save_index_async(next_idx).await;
+
+        if let Ok(meta) = tokio::fs::metadata(self.index_file_path()).await {
+            if let Ok(mtime) = meta.modified() {
+                let mut guard = self.last_index_mtime.write().await;
+                *guard = Some(mtime);
+            }
+        }
+
         let _ = self.rotation_tx.send(next_idx);
 
-        let entry = guard.get(next_idx).cloned();
-        if let Some(ref p) = entry {
+        if let Some(ref proxy) = entry {
             info!(
                 "Proxy rotated to index [{}/{}]: {} ({}:{})",
                 next_idx + 1,
                 total,
-                p.provider,
-                p.host,
-                p.port
+                proxy.provider,
+                proxy.host,
+                proxy.port
             );
         }
         entry
+    }
+
+    #[cfg(test)]
+    fn disable_fs_reload_for_test(&self) {
+        self.last_fs_check_ms.store(u64::MAX, Ordering::SeqCst);
     }
 
     pub async fn test_proxy(&self, entry: &ProxyEntry) -> Result<(String, Duration)> {
@@ -486,6 +586,7 @@ impl ProxyPool {
         let proxy = reqwest::Proxy::all(&proxy_url)?;
         let client = reqwest::Client::builder()
             .proxy(proxy)
+            .connect_timeout(Duration::from_secs(3))
             .timeout(Duration::from_secs(6))
             .build()?;
 
@@ -503,6 +604,7 @@ impl ProxyPool {
 
     pub async fn fetch_from_proxiware_api(api_key: &str) -> Result<Vec<ProxyEntry>> {
         let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))
             .build()?;
 
@@ -512,14 +614,26 @@ impl ProxyPool {
             .get(subs_url)
             .header("X-API-Key", api_key)
             .send()
-            .await?;
+            .await
+            .map_err(|e| {
+                let message = e.to_string();
+                let message = if api_key.is_empty() {
+                    message
+                } else {
+                    message.replace(api_key, "***REDACTED***")
+                };
+                anyhow!("Proxiware request failed: {}", message)
+            })?;
 
-        if !resp.status().is_success() {
-            return Err(anyhow!(
-                "Proxiware API error (status {}): {}",
-                resp.status(),
-                resp.text().await.unwrap_or_default()
-            ));
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let body = if api_key.is_empty() {
+                body
+            } else {
+                body.replace(api_key, "***REDACTED***")
+            };
+            return Err(anyhow!("Proxiware API error (status {}): {}", status, body));
         }
 
         let json: serde_json::Value = resp.json().await?;
@@ -564,6 +678,51 @@ impl ProxyPool {
             Ok(proxies)
         }
     }
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn read_saved_index_from(path: &Path) -> usize {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|content| content.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+/// Write a file with restricted permissions (`0700` parent, `0600` file on Unix).
+pub fn write_restricted_file(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(content.as_bytes())?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+
+    #[cfg(not(unix))]
+    fs::write(path, content)?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -624,33 +783,98 @@ mod tests {
         assert!(ProxyEntry::parse("invalid:too:many:colons:in:line", "custom").is_none());
     }
 
+    #[test]
+    fn test_parse_password_with_colons() {
+        let entry = ProxyEntry::parse(
+            "188.220.163.167:1337:alice:p@ss:w0rd:123 # proxiware-isp",
+            "custom",
+        )
+        .expect("Should parse password containing colons");
+        assert_eq!(entry.host, "188.220.163.167");
+        assert_eq!(entry.port, 1337);
+        assert_eq!(entry.username.as_deref(), Some("alice"));
+        assert_eq!(entry.password.as_deref(), Some("p@ss:w0rd:123"));
+        assert_eq!(entry.provider, "proxiware-isp");
+    }
+
+    #[test]
+    fn test_debug_redacts_password() {
+        let entry = ProxyEntry::parse("1.2.3.4:8080:user:supersecret", "custom").unwrap();
+        let debug = format!("{entry:?}");
+        assert!(!debug.contains("supersecret"));
+        assert!(debug.contains("***REDACTED***"));
+    }
+
     #[tokio::test]
     async fn test_pool_rotation_broadcast() {
+        let dir = tempfile::tempdir().unwrap();
         let p1 = ProxyEntry::parse("1.1.1.1:8080", "custom").unwrap();
         let p2 = ProxyEntry::parse("2.2.2.2:8080", "custom").unwrap();
-        let pool = ProxyPool::new(vec![p1, p2]);
+        let pool = ProxyPool::with_config_dir(vec![p1, p2], dir.path().join("oplire"));
 
         let mut rx = pool.subscribe_rotation();
 
         let rotated = pool.rotate().await;
         assert!(rotated.is_some());
         let new_idx = rx.recv().await.unwrap();
-        assert_eq!(
-            new_idx,
-            pool.active_index.load(std::sync::atomic::Ordering::SeqCst)
-        );
+        assert_eq!(new_idx, pool.active_index.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
     async fn test_pool_rotation_single_proxy_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
         let p1 = ProxyEntry::parse("1.1.1.1:8080", "custom").unwrap();
-        let pool = ProxyPool::new(vec![p1]);
+        let pool = ProxyPool::with_config_dir(vec![p1], dir.path().join("oplire"));
 
         let rotated = pool.rotate().await;
         assert!(
             rotated.is_none(),
             "Pool with <= 1 proxy should return None on rotate to prevent no-op loops"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_rotations_consistency() {
+        let dir = tempfile::tempdir().unwrap();
+        let proxies: Vec<ProxyEntry> = (1..=5)
+            .map(|i| ProxyEntry::parse(&format!("10.0.0.{i}:8080"), "custom").unwrap())
+            .collect();
+        let pool = ProxyPool::with_config_dir(proxies, dir.path().join("oplire"));
+        pool.disable_fs_reload_for_test();
+        pool.active_index.store(0, Ordering::SeqCst);
+
+        let mut handles = Vec::new();
+        for _ in 0..50 {
+            let cloned = pool.clone();
+            handles.push(tokio::spawn(async move { cloned.rotate().await }));
+        }
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for handle in handles {
+                handle.await.unwrap();
+            }
+        })
+        .await
+        .expect("concurrent rotations must not deadlock");
+
+        assert_eq!(pool.active_index.load(Ordering::SeqCst) % 5, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_restricted_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("oplire");
+        let path = nested.join("proxies.txt");
+        write_restricted_file(&path, "1.1.1.1:8080:user:pass").unwrap();
+
+        let dir_mode = fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
+        let file_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "1.1.1.1:8080:user:pass");
     }
 
     #[test]

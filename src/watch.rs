@@ -14,6 +14,10 @@ use crate::pool::ProxyPool;
 /// Default debounce delay (in milliseconds) after a rotation event before resuming log checks.
 pub const DEFAULT_DEBOUNCE_MS: u64 = 5_000;
 
+const MAX_READ_CHUNK: usize = 64 * 1024;
+const MAX_CARRY_BYTES: usize = 16 * 1024;
+const LOG_POLL_MS: u64 = 500;
+
 /// Locate the OpenCode log file on the local system, supporting Linux, macOS, and Windows.
 ///
 /// If a custom path is supplied and exists, it takes precedence. Otherwise standard OS
@@ -25,39 +29,74 @@ pub fn find_opencode_log_path(custom: Option<PathBuf>) -> Option<PathBuf> {
         }
     }
 
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        let path = PathBuf::from(xdg).join("opencode/log/opencode.log");
-        if path.exists() {
-            return Some(path);
-        }
+    let mut candidates = Vec::new();
+
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+        candidates.push(
+            PathBuf::from(xdg)
+                .join("opencode")
+                .join("log")
+                .join("opencode.log"),
+        );
     }
 
-    if let Ok(home) = std::env::var("HOME") {
-        let p1 = PathBuf::from(&home).join(".local/share/opencode/log/opencode.log");
-        if p1.exists() {
-            return Some(p1);
-        }
-        let p2 = PathBuf::from(&home).join("Library/Application Support/opencode/log/opencode.log");
-        if p2.exists() {
-            return Some(p2);
-        }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        candidates.push(
+            home.join(".local")
+                .join("share")
+                .join("opencode")
+                .join("log")
+                .join("opencode.log"),
+        );
+        candidates.push(
+            home.join("Library")
+                .join("Application Support")
+                .join("opencode")
+                .join("log")
+                .join("opencode.log"),
+        );
     }
 
-    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-        let p = PathBuf::from(local_app_data).join("opencode\\log\\opencode.log");
-        if p.exists() {
-            return Some(p);
-        }
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(
+            PathBuf::from(local_app_data)
+                .join("opencode")
+                .join("log")
+                .join("opencode.log"),
+        );
     }
 
-    if let Ok(app_data) = std::env::var("APPDATA") {
-        let p = PathBuf::from(app_data).join("opencode\\log\\opencode.log");
-        if p.exists() {
-            return Some(p);
-        }
+    if let Some(app_data) = std::env::var_os("APPDATA") {
+        candidates.push(
+            PathBuf::from(app_data)
+                .join("opencode")
+                .join("log")
+                .join("opencode.log"),
+        );
     }
 
-    None
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        let profile = PathBuf::from(profile);
+        candidates.push(
+            profile
+                .join("AppData")
+                .join("Local")
+                .join("opencode")
+                .join("log")
+                .join("opencode.log"),
+        );
+        candidates.push(
+            profile
+                .join("AppData")
+                .join("Roaming")
+                .join("opencode")
+                .join("log")
+                .join("opencode.log"),
+        );
+    }
+
+    candidates.into_iter().find(|path| path.exists())
 }
 
 fn is_rate_limit_line(line: &str) -> bool {
@@ -72,6 +111,29 @@ fn is_rate_limit_line(line: &str) -> bool {
         || lower.contains("status=429")
         || lower.contains("status: 429")
         || lower.contains("error: 429")
+}
+
+fn read_chunk_len(file_len: u64, offset: u64) -> usize {
+    (file_len.saturating_sub(offset)).min(MAX_READ_CHUNK as u64) as usize
+}
+
+fn scan_carry(carry: &mut String) -> bool {
+    let mut triggered = false;
+
+    while let Some(pos) = carry.find('\n') {
+        if is_rate_limit_line(&carry[..pos]) {
+            triggered = true;
+            break;
+        }
+        carry.drain(..=pos);
+    }
+
+    if !triggered && carry.len() > MAX_CARRY_BYTES {
+        triggered = is_rate_limit_line(carry);
+        carry.clear();
+    }
+
+    triggered
 }
 
 async fn rotate_proxy(pool: &Option<ProxyPool>) -> bool {
@@ -135,9 +197,19 @@ pub async fn start_watch_mode(
                 path.display().to_string().bold()
             );
 
-            tokio::select! {
-                res = monitor_log_file(path, pool.clone(), debounce_ms) => res,
-                res = monitor_http_upstream(upstream, pool, debounce_ms) => res,
+            if let Err(e) = monitor_log_file(path, pool.clone(), debounce_ms).await {
+                warn!(
+                    "Log monitoring failed ({}). Falling back to HTTP polling on {}",
+                    e, upstream
+                );
+                println!(
+                    "{} Unable to read OpenCode log. Falling back to HTTP check on {}...",
+                    "[INFO]".cyan(),
+                    upstream
+                );
+                monitor_http_upstream(upstream, pool, debounce_ms).await
+            } else {
+                Ok(())
             }
         }
         None => {
@@ -167,64 +239,99 @@ async fn monitor_log_file(
         offset
     );
 
-    let mut buffer = Vec::new();
+    let mut buffer = vec![0u8; 8192];
+    let mut carry = String::new();
 
     loop {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(LOG_POLL_MS)).await;
 
         let meta = match tokio::fs::metadata(&path).await {
-            Ok(m) => m,
+            Ok(meta) => meta,
             Err(_) => continue,
         };
-
         let file_len = meta.len();
-        if file_len < offset {
-            info!("Log file truncated or rotated, resetting offset to 0");
-            offset = 0;
-            let _ = file.seek(SeekFrom::Start(0)).await;
-        }
 
-        if file_len > offset {
-            let bytes_to_read = (file_len - offset) as usize;
-            buffer.resize(bytes_to_read, 0);
-
-            if let Err(e) = file.seek(SeekFrom::Start(offset)).await {
-                warn!("Seek error in log file: {}", e);
-                continue;
+        #[cfg(unix)]
+        let rotated_inode = {
+            use std::os::unix::fs::MetadataExt;
+            match file.metadata().await {
+                Ok(open_meta) => open_meta.ino() != meta.ino() || open_meta.dev() != meta.dev(),
+                Err(_) => false,
             }
+        };
+        #[cfg(not(unix))]
+        let rotated_inode = false;
 
-            match file.read_exact(&mut buffer).await {
-                Ok(_) => {
-                    offset = file_len;
-                    let text = String::from_utf8_lossy(&buffer);
-                    let mut triggered = false;
-
-                    for line in text.lines() {
-                        if is_rate_limit_line(line) {
-                            warn!("OpenCode limit detected in log: {}", line.trim());
-                            println!(
-                                "\n{} Limit detected in OpenCode log!",
-                                "[WARN]".yellow().bold()
-                            );
-                            triggered = true;
-                            break;
-                        }
-                    }
-
-                    if triggered {
-                        rotate_proxy(&pool).await;
-
-                        // Debounce: sleep and skip past any further lines emitted during rotation
-                        tokio::time::sleep(Duration::from_millis(debounce_ms)).await;
-                        if let Ok(m) = tokio::fs::metadata(&path).await {
-                            offset = m.len();
-                            let _ = file.seek(SeekFrom::Start(offset)).await;
-                        }
-                    }
+        if file_len < offset || rotated_inode {
+            match File::open(&path).await {
+                Ok(new_file) => {
+                    info!("Log file rotated or truncated, reopening and resetting offset to 0");
+                    file = new_file;
+                    offset = 0;
+                    carry.clear();
                 }
                 Err(e) => {
-                    warn!("Error reading new bytes from log file: {}", e);
+                    warn!(
+                        "Failed to reopen rotated log file {}: {}",
+                        path.display(),
+                        e
+                    );
+                    continue;
                 }
+            }
+        }
+
+        if file_len <= offset {
+            continue;
+        }
+
+        let delta = read_chunk_len(file_len, offset);
+        if delta == 0 {
+            continue;
+        }
+        buffer.resize(delta, 0);
+
+        if let Err(e) = file.seek(SeekFrom::Start(offset)).await {
+            warn!("Seek error in log file: {}", e);
+            continue;
+        }
+
+        match file.read(&mut buffer[..delta]).await {
+            Ok(0) => {
+                // The descriptor still points at an old, renamed inode.
+                match File::open(&path).await {
+                    Ok(new_file) => {
+                        file = new_file;
+                        offset = 0;
+                        carry.clear();
+                    }
+                    Err(e) => {
+                        warn!("Failed to reopen log file after EOF: {}", e);
+                    }
+                }
+            }
+            Ok(n) => {
+                offset += n as u64;
+                carry.push_str(&String::from_utf8_lossy(&buffer[..n]));
+
+                if scan_carry(&mut carry) {
+                    carry.clear();
+                    rotate_proxy(&pool).await;
+                    tokio::time::sleep(Duration::from_millis(debounce_ms)).await;
+
+                    match File::open(&path).await {
+                        Ok(mut new_file) => {
+                            offset = new_file.seek(SeekFrom::End(0)).await.unwrap_or(0);
+                            file = new_file;
+                        }
+                        Err(e) => {
+                            warn!("Failed to reopen log file after rotation: {}", e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Error reading new bytes from log file: {}", e);
             }
         }
     }
@@ -236,6 +343,8 @@ async fn monitor_http_upstream(
     debounce_ms: u64,
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(10))
         .build()?;
 
@@ -269,5 +378,40 @@ async fn monitor_http_upstream(
                 // Quietly ignore network connect errors to upstream if service is offline
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scan_carry_detects_fragmented_429() {
+        let mut carry = String::from("some log line status=");
+        assert!(!scan_carry(&mut carry));
+        carry.push_str("429\n");
+        assert!(scan_carry(&mut carry));
+    }
+
+    #[test]
+    fn test_scan_carry_overflow_guard() {
+        let mut carry = String::from("status=429 ");
+        carry.push_str(&"x".repeat(MAX_CARRY_BYTES));
+        assert!(!carry.contains('\n'));
+        assert!(scan_carry(&mut carry));
+    }
+
+    #[test]
+    fn test_read_chunk_len_is_bounded() {
+        assert_eq!(read_chunk_len(u64::MAX, 0), MAX_READ_CHUNK);
+        assert_eq!(read_chunk_len(10, 4), 6);
+        assert_eq!(read_chunk_len(4, 10), 0);
+    }
+
+    #[test]
+    fn test_is_rate_limit_patterns() {
+        assert!(is_rate_limit_line("HTTP status=429"));
+        assert!(is_rate_limit_line("quotaExceeded"));
+        assert!(!is_rate_limit_line("all good"));
     }
 }

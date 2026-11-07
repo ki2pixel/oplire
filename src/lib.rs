@@ -14,4 +14,4 @@ pub mod proxy;
 pub mod watch;
 
 pub use config::AppConfig;
-pub use pool::{ProxyEntry, ProxyPool};
+pub use pool::{write_restricted_file, ProxyEntry, ProxyPool};

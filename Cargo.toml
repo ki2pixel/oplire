@@ -19,12 +19,14 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
 tokio = { version = "1", features = ["full", "process"] }
-reqwest = { version = "0.12", features = ["json", "gzip", "brotli", "blocking"] }
-futures = "0.3"
+reqwest = { version = "0.12", features = ["json", "gzip", "brotli"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"
 base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 strip = true

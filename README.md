@@ -35,11 +35,19 @@ OpenCode imposes daily message quotas per IP on free models (e.g. DeepSeek V4.1 
 - Auto-detects active OpenCode logs across all supported operating systems:
   - **Linux**: `~/.local/share/opencode/log/opencode.log` or `$XDG_DATA_HOME/opencode/log/opencode.log`
   - **macOS**: `~/Library/Application Support/opencode/log/opencode.log`
-  - **Windows**: `%LOCALAPPDATA%\opencode\log\opencode.log` or `%APPDATA%\opencode\log\opencode.log`
+  - **Windows**: `%LOCALAPPDATA%\opencode\log\opencode.log`, `%APPDATA%\opencode\log\opencode.log`, or `%USERPROFILE%\AppData\...\opencode\log\opencode.log`
   - **Custom**: user-specified log path via `--log-file <path>`
 - Watches appended log entries in real time for 429 rate-limit errors or quota warnings.
 - Rotates to the next proxy in the pool automatically with a configurable debounce delay (`--delay-ms`, default 5000ms).
-- Falls back to periodic HTTP polling on the upstream `/v1/models` endpoint when no log file is found.
+- Falls back to periodic HTTP polling on the upstream `/v1/models` endpoint when no log file is found or the log cannot be opened initially.
+
+### Security Notes
+
+- **SSRF protection**: `CONNECT` targets that resolve to loopback, link-local, RFC 1918, CGNAT (`100.64.0.0/10`), or reserved `.local` / `.internal` / `.localhost` names are rejected with `403 Forbidden`. Hostnames are resolved with a 3-second bound to mitigate DNS rebinding.
+- **DoS limits**: at most 512 concurrent client connections; client and upstream headers are read under 5 s / 8 s timeouts and capped at 8 KiB / 4 KiB respectively.
+- **File permissions (Unix)**: `~/.config/oplire` is created with `0700`; `proxies.txt` and `config.json` are written with `0600`.
+- **Binding warning**: binding to a non-loopback address logs a security warning because the local proxy has no inbound authentication.
+- **`/health`**: `GET` returns `OK`; `HEAD` returns the same headers (`Content-Length: 2`) without any body bytes, per RFC 9110.
 
 ---
 
@@ -163,7 +171,7 @@ oplire doctor                         # Diagnose OpenCode, upstream reachability
 oplire models                         # List available upstream OpenCode models (default: http://localhost:3000)
 oplire models --upstream <url>        # List models from a custom OpenCode Zen upstream URL
 oplire config show                    # Show current configuration values and config file path
-oplire config set --listen :8080      # Set default listen address
+oplire config set --listen :8080      # Set default listen address (:8080 -> 127.0.0.1:8080)
 oplire config set --upstream <url>    # Set default OpenCode Zen upstream URL
 oplire config reset                   # Reset configuration to defaults
 oplire about                          # Show version, author, and system information
@@ -186,7 +194,7 @@ When starting `oplire proxy`, `oplire watch`, or `oplire daemon`, proxies are lo
 
 ### Persistence & Hot-Reloading
 - **Active Proxy Index**: Persistent rotation state is saved in `~/.config/oplire/active_proxy.idx`.
-- **Dynamic Hot-Reload**: oplire monitors file modification timestamps (`mtime`) on both `proxies.txt` and `active_proxy.idx`. If you edit `proxies.txt` or rotate proxies in another terminal via `oplire proxies next`, the running proxy server immediately detects the change without requiring a restart.
+- **Dynamic Hot-Reload**: oplire monitors file modification timestamps (`mtime`) on both `proxies.txt` and `active_proxy.idx`. If you edit `proxies.txt` or rotate proxies in another terminal via `oplire proxies next`, the running proxy server immediately detects the change without requiring a restart. Filesystem checks are throttled to at most once per second so a `CONNECT` never triggers synchronous disk I/O.
 - **Active Tunnel Teardown**: Upon rotation, oplire broadcasts an abort signal across all active CONNECT tunnels, triggering an immediate reconnect through the newly selected proxy.
 
 ### Supported Formats in `proxies.txt`
@@ -195,9 +203,12 @@ When starting `oplire proxy`, `oplire watch`, or `oplire daemon`, proxies are lo
 188.220.163.167:1337:username:password # proxiware-isp
 51.241.234.51:1337:username:password
 
-# URL format (HTTP or SOCKS5)
+# Passwords may contain ':' (splitn(4) parsing)
+188.220.163.167:1337:username:p@ss:w0rd:123 # proxiware-isp
+
+# URL format (only http:// is supported for CONNECT tunneling)
 http://username:password@188.220.163.167:1337
-socks5://username:password@188.220.163.167:1080
+# socks5:// and https:// entries are parsed but rejected with 502 Bad Gateway
 
 # IP:Port without auth (if exit IP is whitelisted on provider dashboard)
 188.220.163.167:1337
@@ -256,7 +267,7 @@ OpenCode calculates daily free message quotas strictly by IP address, resetting 
 
 oplire 3.0.0 removes the Claude Code integration and Cloudflare WARP support:
 
-- The Anthropic ↔ OpenCode bridge and its reverse endpoints (`/v1/messages`, `/v1/models`, `/v1/chat/completions`) are gone. `oplire proxy` is now a forward HTTP CONNECT proxy only. The `/health` endpoint remains available.
+- The Anthropic ↔ OpenCode bridge and its reverse endpoints (`/v1/messages`, `/v1/models`, `/v1/chat/completions`) are gone. `oplire proxy` is now a forward HTTP CONNECT proxy only. The `/health` endpoint remains available (`GET` and `HEAD`).
 - Removed commands: `status`, `reset`, `quick-reset`, `stop`, `connect claude-code`, `install warp`, `install claude-code`, `install all`.
 - Removed flags: `--dry-run`, `--api-key`, `--max-retries`, `--warp-delay`.
 - The configuration keys `api_key`, `max_retries`, and `warp_delay` are ignored. Run `oplire config reset` or re-save the configuration to clean them up.

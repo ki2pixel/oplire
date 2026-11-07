@@ -3,4 +3,4 @@
 pub mod server;
 pub mod tunnel;
 
-pub use server::start_proxy_server;
+pub use server::{parse_listen_addr, serve_proxy, start_proxy_server};
