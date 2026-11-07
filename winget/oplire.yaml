@@ -1,0 +1,19 @@
+PackageIdentifier: BerkeOruc.oplire
+PackageVersion: 3.0.0
+PackageName: oplire
+PackageDescription: OpenCode proxy pool manager with automatic rate-limit rotation
+Publisher: Berke Oruc
+PublisherUrl: https://github.com/BerkeOruc/oplire
+Author: Berke Oruc
+License: MIT
+LicenseUrl: https://github.com/BerkeOruc/oplire/blob/main/LICENSE
+ShortDescription: OpenCode proxy pool manager
+PackageUrl: https://github.com/BerkeOruc/oplire
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/BerkeOruc/oplire/releases/download/v3.0.0/oplire-windows.exe
+    InstallerSha256: REPLACEME
+    ReleaseDate: 2026-11-07
+    Scope: machine
+Commands:
+  - oplire
