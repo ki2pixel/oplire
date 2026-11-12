@@ -1,6 +1,10 @@
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use oplire_reset::{write_restricted_file, AppConfig, ProxyPool};
+use oplire_reset::{
+    analyze_transcript, estimate_pool_size, parse_transcript_from_file, print_audit_report,
+    print_pool_estimation, write_restricted_file, AppConfig, ProxyPool,
+    NOMINAL_OUTPUT_QUOTA_PER_IP,
+};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -90,6 +94,29 @@ enum Commands {
         /// OpenCode Zen upstream URL
         #[arg(long, default_value = "http://localhost:3000")]
         upstream: String,
+    },
+    /// Analyze an OpenCode transcript to audit proxy rotations and quota thresholds
+    Audit {
+        /// Path to the OpenCode transcript JSON file
+        transcript_file: PathBuf,
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Estimate the proxy pool size needed for a projected workload
+    Estimate {
+        /// Projected output completion tokens
+        #[arg(short = 'o', long = "tokens-out")]
+        tokens_out: u64,
+        /// Optional projected input prompt tokens
+        #[arg(short = 'i', long = "tokens-in")]
+        tokens_in: Option<u64>,
+        /// Quota threshold per proxy in output tokens (default: 60,000)
+        #[arg(short = 'q', long = "quota-per-proxy", default_value_t = NOMINAL_OUTPUT_QUOTA_PER_IP)]
+        quota_per_proxy: u64,
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text")]
+        format: String,
     },
 }
 
@@ -1075,6 +1102,55 @@ async fn main() -> anyhow::Result<()> {
             println!("#   opencode");
         }
 
+        Commands::Audit {
+            transcript_file,
+            format,
+        } => match parse_transcript_from_file(transcript_file) {
+            Ok(export) => {
+                let report = analyze_transcript(&export);
+                if format.eq_ignore_ascii_case("json") {
+                    match serde_json::to_string_pretty(&report) {
+                        Ok(json_output) => println!("{}", json_output),
+                        Err(e) => {
+                            eprintln!("{} Failed to serialize report: {}", "[ERROR]".red(), e);
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    print_audit_report(&report);
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "{} Failed to audit transcript '{}': {}",
+                    "[ERROR]".red(),
+                    transcript_file.display(),
+                    e
+                );
+                std::process::exit(1);
+            }
+        },
+
+        Commands::Estimate {
+            tokens_out,
+            tokens_in,
+            quota_per_proxy,
+            format,
+        } => {
+            let estimation = estimate_pool_size(*tokens_out, *tokens_in, Some(*quota_per_proxy));
+            if format.eq_ignore_ascii_case("json") {
+                match serde_json::to_string_pretty(&estimation) {
+                    Ok(json_output) => println!("{}", json_output),
+                    Err(e) => {
+                        eprintln!("{} Failed to serialize estimation: {}", "[ERROR]".red(), e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                print_pool_estimation(&estimation);
+            }
+        }
+
         Commands::About {} => {
             print_banner();
             println!();
@@ -1100,6 +1176,10 @@ async fn main() -> anyhow::Result<()> {
             println!("  oplire daemon              # Background proxy service");
             println!("  oplire watch               # Monitor OpenCode, rotate on limits");
             println!();
+            println!("{}", "Forensic Audit & Pool Sizing:".bold());
+            println!("  oplire audit <file>        # Audit OpenCode transcript for quota cutoffs");
+            println!("  oplire estimate -o <tok>   # Estimate required proxy pool size");
+            println!();
             println!("{}", "Configuration:".bold());
             println!("  oplire models              # List available OpenCode models");
             println!("  oplire config show         # Show current config");
@@ -1122,6 +1202,8 @@ async fn main() -> anyhow::Result<()> {
             | Commands::Models { .. }
             | Commands::Proxies { .. }
             | Commands::Env { .. }
+            | Commands::Audit { .. }
+            | Commands::Estimate { .. }
     ) {
         println!("\n{} v{}", "oplire".bold(), VERSION.dimmed());
     }

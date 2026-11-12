@@ -17,6 +17,7 @@ Thumbs.db
 *.proxy.txt
 proxiware-isp.txt
 proxies.txt
+overlays-*.json
 
 # Local tools
 .commandcode/
