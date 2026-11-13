@@ -282,6 +282,16 @@ OpenCode calculates daily free message quotas strictly by IP address, resetting 
 - **02:00 CEST** (UTC+2 / Summer time in Western Europe)
 - **01:00 CET** (UTC+1 / Winter time in Western Europe)
 
+### 3. OpenCode 2.3+ Client-Side Lockout ("Free limit reached" popup)
+Starting with OpenCode 2.3.0 Desktop, hitting an IP quota triggers a client-side hard lockout:
+- **Symptom**: The prompt composer disappears entirely and is replaced by a blocking card: *"Free limit reached - Free usage resets at [time]. Connect a provider or subscribe to Go to continue"*. Even if `oplire` rotates to an unused proxy with 100% quota remaining, the UI prevents typing or continuing.
+- **Root Cause**: The Desktop frontend intercepts `session.step.failed` (`provider.free-limit`), writes a lockout timestamp into `~/.config/ai.opencode.desktop/drafts.sqlite` (table `state`, key `free-limit` in `opencode.global.dat`), and unmounts `<Composer />` in favor of `<SessionFreeLimitPanel />`.
+- **How oplire handles it**:
+  - **Dynamic auto-unlock**: `oplire` automatically clears the SQLite `free-limit` lock in `drafts.sqlite` on every proxy rotation event.
+  - **Startup auto-unlock**: The `opencode-proxy` launcher clears stale SQLite locks before booting OpenCode.
+  - **Permanent UI Patch (`app.asar`)**: To prevent the in-memory UI from ever unmounting the composer during active sessions, a constant-length binary patch can be applied to `/opt/OpenCode/resources/app.asar`.
+  - For full forensic details, decompilation analysis, and the automated patch script, see [docs/contournement-verrouillage-client-opencode-2.3.md](docs/contournement-verrouillage-client-opencode-2.3.md).
+
 ---
 
 ## Upgrading from v2

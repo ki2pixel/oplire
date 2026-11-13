@@ -136,6 +136,41 @@ fn scan_carry(carry: &mut String) -> bool {
     triggered
 }
 
+async fn unlock_opencode_desktop_state() {
+    let mut candidate_dbs = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        candidate_dbs.push(
+            home.join(".config")
+                .join("ai.opencode.desktop")
+                .join("drafts.sqlite"),
+        );
+        candidate_dbs.push(
+            home.join("Library")
+                .join("Application Support")
+                .join("ai.opencode.desktop")
+                .join("drafts.sqlite"),
+        );
+    }
+    if let Some(app_data) = std::env::var_os("APPDATA") {
+        candidate_dbs.push(
+            PathBuf::from(app_data)
+                .join("ai.opencode.desktop")
+                .join("drafts.sqlite"),
+        );
+    }
+
+    for db in candidate_dbs {
+        if db.exists() {
+            let _ = tokio::process::Command::new("sqlite3")
+                .arg(&db)
+                .arg("UPDATE state SET value = '{\"resetAt\":null}' WHERE name = 'opencode.global.dat' AND key = 'free-limit';")
+                .output()
+                .await;
+        }
+    }
+}
+
 async fn rotate_proxy(pool: &Option<ProxyPool>) -> bool {
     match pool {
         Some(pool) => match pool.rotate().await {
@@ -147,6 +182,7 @@ async fn rotate_proxy(pool: &Option<ProxyPool>) -> bool {
                     next.host,
                     next.port
                 );
+                unlock_opencode_desktop_state().await;
                 true
             }
             None => {
